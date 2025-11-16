@@ -143,6 +143,38 @@ def strip_www_and_port(netloc: str) -> str:
     return host
 
 
+def normalize_path(path: str, strip_trailing_slash: bool = True) -> str:
+    """
+    Normalize a URL path:
+    - Defaults to "/" if empty
+    - Collapses duplicate slashes
+    - Normalizes dot segments (../../etc)
+    - Ensures leading slash
+    - Optionally removes trailing slash (unless root)
+    """
+    if not path:
+        path = "/"
+
+    # Collapse duplicate slashes
+    path = re.sub(r"/+", "/", path)
+
+    # Normalize dot segments
+    try:
+        path = posixpath.normpath(path)
+    except Exception:
+        pass  # Keep as-is if normpath fails
+
+    # Ensure leading slash
+    if not path.startswith("/"):
+        path = "/" + path
+
+    # Remove trailing slash (unless root)
+    if strip_trailing_slash and path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
+    return path
+
+
 def canonical_key(url: str) -> str:
     """
     Canonical key that is insensitive to scheme, www, port, and trailing slash.
@@ -156,19 +188,7 @@ def canonical_key(url: str) -> str:
         return ""
     host = strip_www_and_port(p.netloc)
 
-    path = p.path or "/"
-    # collapse duplicate slashes
-    path = re.sub(r"/+", "/", path)
-    # normalize dot segments
-    try:
-        path = posixpath.normpath(path)
-    except Exception:
-        # fallback: keep as-is if normpath fails for any reason
-        pass
-    if not path.startswith("/"):
-        path = "/" + path
-    if path != "/":
-        path = path.rstrip("/")
+    path = normalize_path(p.path or "/")
 
     if path == "/":
         return host
@@ -180,6 +200,22 @@ def same_domain(url: str, allowed_domain: str) -> bool:
     if not p.netloc:
         return False
     return strip_www_and_port(p.netloc) == allowed_domain
+
+
+def within_path_prefix(url: str, allowed_domain: str, path_prefix: str) -> bool:
+    """
+    Check if url is within the allowed domain and path prefix.
+    If path_prefix is empty, any path on the domain is allowed.
+    """
+    if not same_domain(url, allowed_domain):
+        return False
+    if not path_prefix:
+        return True
+
+    p = urlparse(url)
+    url_path = normalize_path(p.path or "/", strip_trailing_slash=False)
+
+    return url_path.startswith(path_prefix) or url_path == path_prefix.rstrip("/")
 
 
 def resolve_and_strip(base_url: str, href: str) -> str:
@@ -381,6 +417,10 @@ def crawl(seed_url: str, json_path: str) -> None:
     allowed_domain = strip_www_and_port(parsed.netloc)
     seed_scheme = parsed.scheme.lower() if parsed.scheme else None
 
+    # Extract the seed path prefix to constrain crawling within that subtree
+    seed_path = normalize_path(parsed.path or "/")
+    seed_path_prefix = seed_path if seed_path != "/" else ""
+
     # Determine per-domain JSON path (e.g., ghuntley-com.json)
     default_name = pathlib.Path(json_path).name
     domain_filename = f"{allowed_domain.replace('.', '-')}.json"
@@ -494,7 +534,7 @@ def crawl(seed_url: str, json_path: str) -> None:
 
             out_neighbors: Set[str] = set()
             for link in links:
-                if not same_domain(link, allowed_domain):
+                if not within_path_prefix(link, allowed_domain, seed_path_prefix):
                     continue
                 c = canonical_key(link)
                 if not c:
