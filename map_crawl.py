@@ -3,6 +3,7 @@
 # dependencies = [
 #     "httpx",
 #     "beautifulsoup4",
+#     "lxml",
 #     "playwright",
 # ]
 # ///
@@ -77,12 +78,14 @@ If you want, I can extend the script to:
 
 import argparse
 import contextlib
+import gzip
 import json
 import pathlib
 import posixpath
 import re
 import sys
-from typing import Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
@@ -402,7 +405,334 @@ def fetch_html_playwright(url: str) -> Optional[Tuple[str, str]]:
         return None
 
 
-def crawl(seed_url: str, json_path: str) -> None:
+# ---------------------------------------------------------------------------
+# URL Discovery (robots.txt, sitemaps, llms.txt, feeds)
+# ---------------------------------------------------------------------------
+
+FEED_PATHS = ["/feed/", "/feed.xml", "/rss/", "/rss.xml", "/atom.xml"]
+
+
+def _strip_doc_extension(canon: str) -> str:
+    """Strip .md/.html/.htm to get base for deduplication."""
+    for ext in (".md", ".html", ".htm"):
+        if canon.endswith(ext):
+            return canon[: -len(ext)]
+    return canon
+
+
+def merge_urls_with_md_preference(urls: Iterable[str]) -> Set[str]:
+    """Merge URLs, preferring .md versions over others."""
+    by_base: Dict[str, str] = {}
+    for url in urls:
+        canon = canonical_key(url)
+        if not canon:
+            continue
+        base = _strip_doc_extension(canon)
+        existing = by_base.get(base)
+        if existing is None:
+            by_base[base] = canon
+        elif canon.endswith(".md") and not existing.endswith(".md"):
+            by_base[base] = canon  # .md wins
+    return set(by_base.values())
+
+
+def fetch_text(
+    url: str, client: httpx.Client, accept_xml: bool = False
+) -> Optional[str]:
+    """Fetch URL, handle gzip, return text or None."""
+    try:
+        headers = {}
+        if accept_xml:
+            headers["Accept"] = "application/xml, text/xml, */*"
+        r = client.get(url, timeout=15, headers=headers)
+        if r.status_code >= 400:
+            return None
+        # Handle gzip
+        if url.endswith(".gz") or r.headers.get("content-encoding") == "gzip":
+            return gzip.decompress(r.content).decode("utf-8")
+        return r.text
+    except Exception:
+        return None
+
+
+def parse_robots_txt(content: str, base_url: str) -> Tuple[List[str], List[str]]:
+    """Extract Sitemap URLs and Disallow paths from robots.txt.
+
+    Returns (sitemap_urls, disallow_page_urls).
+    Disallow paths can reveal interesting site structure even when blocking crawlers.
+    """
+    sitemaps = []
+    disallow_urls = []
+    for line in content.splitlines():
+        line = line.strip()
+        lower = line.lower()
+        if lower.startswith("sitemap:"):
+            url = line.split(":", 1)[1].strip()
+            if url:
+                sitemaps.append(urljoin(base_url, url))
+        elif lower.startswith("disallow:"):
+            path = line.split(":", 1)[1].strip()
+            # Skip wildcards, empty, and root-only paths
+            if path and "*" not in path and path != "/":
+                disallow_urls.append(urljoin(base_url, path))
+    return sitemaps, disallow_urls
+
+
+def parse_sitemap(content: str) -> Tuple[List[str], List[str]]:
+    """
+    Parse sitemap XML.
+    Returns (page_urls, nested_sitemap_urls).
+    """
+    soup = BeautifulSoup(content, "lxml-xml")
+    page_urls = []
+    nested_sitemaps = []
+
+    # Check for sitemapindex
+    for sitemap in soup.find_all("sitemap"):
+        loc = sitemap.find("loc")
+        if loc and loc.string:
+            nested_sitemaps.append(loc.string.strip())
+
+    # Check for urlset
+    for url_tag in soup.find_all("url"):
+        loc = url_tag.find("loc")
+        if loc and loc.string:
+            page_urls.append(loc.string.strip())
+
+    return page_urls, nested_sitemaps
+
+
+def fetch_sitemap_recursive(
+    url: str, client: httpx.Client, visited: Set[str], max_depth: int = 3
+) -> List[str]:
+    """Recursively fetch sitemaps, return all page URLs."""
+    if url in visited or max_depth <= 0:
+        return []
+    visited.add(url)
+
+    content = fetch_text(url, client, accept_xml=True)
+    if not content:
+        return []
+
+    pages, nested = parse_sitemap(content)
+
+    for nested_url in nested:
+        pages.extend(fetch_sitemap_recursive(nested_url, client, visited, max_depth - 1))
+
+    return pages
+
+
+def parse_llms_txt(content: str, base_url: str) -> List[str]:
+    """Extract URLs from llms.txt content (handles both absolute and relative)."""
+    urls = []
+
+    # Markdown links: [text](url) - capture any href (absolute or relative)
+    md_link = re.compile(r"\[.*?\]\(([^\s)]+)\)")
+    # Reference links: [text]: url
+    md_ref = re.compile(r"\[.*?\]:\s*(\S+)")
+    # Bare URLs (with scheme) or paths (starting with /)
+    bare_url_or_path = re.compile(r"(?:^|\s)((?:https?://|/)\S+)")
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        found: List[str] = []
+        # Try markdown link patterns first
+        found.extend(md_link.findall(line))
+        found.extend(md_ref.findall(line))
+
+        # If no markdown links found, try bare URL/path
+        if not found:
+            found.extend(bare_url_or_path.findall(line))
+
+        urls.extend(found)
+
+    # Resolve all URLs (urljoin handles both absolute and relative)
+    return [urljoin(base_url, u) for u in urls]
+
+
+def parse_feed(content: str) -> Tuple[List[str], Optional[str]]:
+    """Extract entry URLs and next page URL from RSS or Atom feed.
+
+    Returns (entry_urls, next_page_url).
+    """
+    soup = BeautifulSoup(content, "lxml-xml")
+    urls = []
+    next_url = None
+
+    # RSS 2.0
+    for item in soup.find_all("item"):
+        link = item.find("link")
+        if link and link.string:
+            urls.append(link.string.strip())
+        else:
+            # Fallback to guid if permalink
+            guid = item.find("guid")
+            if guid and guid.get("isPermaLink", "").lower() == "true":
+                if guid.string:
+                    urls.append(guid.string.strip())
+
+    # Atom
+    for entry in soup.find_all("entry"):
+        for link in entry.find_all("link"):
+            href = link.get("href")
+            rel = link.get("rel", "alternate")
+            if href and rel in ("alternate", None):
+                urls.append(href)
+
+    # Check for pagination (rel="next") - works for both RSS and Atom
+    for link in soup.find_all("link"):
+        rel = link.get("rel")
+        if rel == "next":
+            next_url = link.get("href")
+            break
+
+    return urls, next_url
+
+
+def fetch_feed_with_pagination(
+    url: str, client: httpx.Client, visited: Optional[Set[str]] = None, max_pages: int = 5
+) -> List[str]:
+    """Fetch feed with pagination support, return all entry URLs."""
+    if visited is None:
+        visited = set()
+    if url in visited or max_pages <= 0:
+        return []
+    visited.add(url)
+
+    content = fetch_text(url, client, accept_xml=True)
+    if not content:
+        return []
+
+    entry_urls, next_url = parse_feed(content)
+
+    if next_url:
+        resolved_next = urljoin(url, next_url)
+        if resolved_next not in visited:
+            entry_urls.extend(
+                fetch_feed_with_pagination(resolved_next, client, visited, max_pages - 1)
+            )
+
+    return entry_urls
+
+
+def discover_from_feeds(base_url: str, client: httpx.Client) -> List[str]:
+    """Try common feed endpoints, return URLs from first successful one (with pagination)."""
+    for path in FEED_PATHS:
+        url = urljoin(base_url, path)
+        urls = fetch_feed_with_pagination(url, client)
+        if urls:
+            return urls
+    return []
+
+
+def parse_html_head_links(content: str, base_url: str) -> Tuple[List[str], List[str]]:
+    """Extract sitemap and feed URLs from HTML <link> tags.
+
+    Returns (sitemap_urls, feed_urls).
+    """
+    soup = BeautifulSoup(content, "html.parser")
+    sitemap_urls = []
+    feed_urls = []
+
+    for link in soup.find_all("link"):
+        rel = link.get("rel", [])
+        if isinstance(rel, list):
+            rel = " ".join(rel)
+        rel = rel.lower()
+        href = link.get("href")
+        if not href:
+            continue
+
+        resolved = urljoin(base_url, href)
+
+        if "sitemap" in rel:
+            sitemap_urls.append(resolved)
+        elif "alternate" in rel:
+            link_type = (link.get("type") or "").lower()
+            if "rss" in link_type or "atom" in link_type or "xml" in link_type:
+                feed_urls.append(resolved)
+
+    return sitemap_urls, feed_urls
+
+
+def discover_urls(base_url: str, client: httpx.Client) -> Set[str]:
+    """
+    Discover URLs from all sources in parallel.
+    Returns deduplicated set with .md preference.
+    """
+    all_urls: List[str] = []
+
+    def discover_from_robots() -> List[str]:
+        content = fetch_text(urljoin(base_url, "/robots.txt"), client)
+        if not content:
+            return []
+        sitemap_urls, disallow_urls = parse_robots_txt(content, base_url)
+        pages: List[str] = list(disallow_urls)  # Disallow paths as seed hints
+        visited: Set[str] = set()
+        for sm_url in sitemap_urls:
+            pages.extend(fetch_sitemap_recursive(sm_url, client, visited))
+        return pages
+
+    def discover_from_sitemap_direct() -> List[str]:
+        # Try common sitemap locations directly
+        for path in ["/sitemap.xml", "/sitemap_index.xml"]:
+            urls = fetch_sitemap_recursive(urljoin(base_url, path), client, set())
+            if urls:
+                return urls
+        return []
+
+    def discover_from_llms() -> List[str]:
+        content = fetch_text(urljoin(base_url, "/llms.txt"), client)
+        return parse_llms_txt(content, base_url) if content else []
+
+    def discover_from_feeds_wrapper() -> List[str]:
+        return discover_from_feeds(base_url, client)
+
+    def discover_from_html_head() -> List[str]:
+        content = fetch_text(base_url, client)
+        if not content:
+            return []
+        sitemap_urls, feed_urls = parse_html_head_links(content, base_url)
+        pages: List[str] = []
+        visited: Set[str] = set()
+        for sm_url in sitemap_urls:
+            pages.extend(fetch_sitemap_recursive(sm_url, client, visited))
+        for feed_url in feed_urls:
+            pages.extend(fetch_feed_with_pagination(feed_url, client))
+        return pages
+
+    tasks = {
+        "robots": discover_from_robots,
+        "sitemap": discover_from_sitemap_direct,
+        "llms": discover_from_llms,
+        "feeds": discover_from_feeds_wrapper,
+        "html_head": discover_from_html_head,
+    }
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                urls = future.result()
+                all_urls.extend(urls)
+                if urls:
+                    print(f"[{name}] Found {len(urls)} URLs", file=sys.stderr)
+            except Exception as e:
+                print(f"[{name}] Failed: {e}", file=sys.stderr)
+
+    return merge_urls_with_md_preference(all_urls)
+
+
+# ---------------------------------------------------------------------------
+# Crawl
+# ---------------------------------------------------------------------------
+
+
+def crawl(seed_url: str, json_path: str, discover: bool = True) -> None:
     # ensure absolute seed with scheme for initial parsing
     seed_abs = (
         seed_url
@@ -456,6 +786,25 @@ def crawl(seed_url: str, json_path: str) -> None:
         follow_redirects=True,
         headers={"User-Agent": "stupid-simple-crawler/0.1 (+https://example.invalid)"},
     )
+
+    # URL discovery from robots.txt, sitemaps, llms.txt, feeds
+    if discover:
+        print("Discovering URLs from sitemaps, llms.txt, feeds...", file=sys.stderr)
+        base_url = f"{seed_scheme or 'https'}://{allowed_domain}"
+        discovered = discover_urls(base_url, client)
+
+        # Filter to allowed domain/path and add to queue
+        added = 0
+        for canon in discovered:
+            if not within_path_prefix(
+                f"https://{canon}", allowed_domain, seed_path_prefix
+            ):
+                continue
+            if canon not in visited and canon not in to_visit:
+                to_visit.append(canon)
+                added += 1
+        if added:
+            print(f"Added {added} discovered URLs to queue", file=sys.stderr)
 
     try:
         while to_visit:
@@ -580,8 +929,13 @@ def main() -> None:
         default="crawl_map.json",
         help="Path to JSON map file (default: ./crawl_map.json)",
     )
+    parser.add_argument(
+        "--no-discover",
+        action="store_true",
+        help="Skip URL discovery from robots.txt, sitemaps, llms.txt, feeds",
+    )
     args = parser.parse_args()
-    crawl(args.url, args.json)
+    crawl(args.url, args.json, discover=not args.no_discover)
 
 
 if __name__ == "__main__":
