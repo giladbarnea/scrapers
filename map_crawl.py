@@ -221,6 +221,75 @@ def within_path_prefix(url: str, allowed_domain: str, path_prefix: str) -> bool:
     return url_path.startswith(path_prefix) or url_path == path_prefix.rstrip("/")
 
 
+def parse_filter_spec(spec: str, seed_domain: str) -> Tuple[str, str]:
+    """
+    Parse a filter specification into (domain, path_prefix).
+
+    Supports flexible input formats:
+    - Full URLs: https://docs.cloud.google.com/pubsub/docs -> (docs.cloud.google.com, /pubsub/docs)
+    - URLs with www: www.example.com/path -> (example.com, /path)
+    - Domain + path: example.com/foo/bar -> (example.com, /foo/bar)
+    - Bare paths: pubsub/docs or /pubsub/docs -> (seed_domain, /pubsub/docs)
+
+    Args:
+        spec: Filter specification in any of the above formats
+        seed_domain: Domain from seed URL (used as fallback for bare paths)
+
+    Returns:
+        (domain, path_prefix) tuple. path_prefix has leading slash, no trailing slash (unless root).
+        Empty path_prefix means no path filtering (domain-only).
+
+    Examples:
+        parse_filter_spec("https://example.com/foo/bar", "seed.com")
+            -> ("example.com", "/foo/bar")
+        parse_filter_spec("www.example.com/foo/bar", "seed.com")
+            -> ("example.com", "/foo/bar")
+        parse_filter_spec("example.com/foo", "seed.com")
+            -> ("example.com", "/foo")
+        parse_filter_spec("foo/bar", "seed.com")
+            -> ("seed.com", "/foo/bar")
+        parse_filter_spec("/foo/bar", "seed.com")
+            -> ("seed.com", "/foo/bar")
+        parse_filter_spec("example.com", "seed.com")
+            -> ("example.com", "")
+    """
+    if not spec:
+        return seed_domain, ""
+
+    spec = spec.strip()
+
+    # Remove scheme if present (idempotent - can be called multiple times)
+    spec = re.sub(r'^https?://', '', spec, flags=re.IGNORECASE)
+    # Remove www. prefix (idempotent)
+    spec = re.sub(r'^www\.', '', spec, flags=re.IGNORECASE)
+
+    # Find first slash to separate domain from path
+    first_slash = spec.find('/')
+
+    if first_slash == -1:
+        # No slash - could be domain-only or bare path segment
+        if '.' in spec:
+            # It's a domain without path (e.g., "example.com")
+            return strip_www_and_port(spec), ""
+        else:
+            # It's a bare path segment (e.g., "pubsub")
+            path = normalize_path('/' + spec, strip_trailing_slash=True)
+            return seed_domain, path
+    else:
+        # Has slash - check if first component is a domain
+        first_component = spec[:first_slash]
+        if '.' in first_component:
+            # It's domain + path (e.g., "example.com/foo/bar")
+            domain = strip_www_and_port(first_component)
+            path_part = spec[first_slash:]
+            path = normalize_path(path_part, strip_trailing_slash=True)
+            return domain, path
+        else:
+            # It's just a path without domain (e.g., "foo/bar")
+            path = normalize_path('/' + spec, strip_trailing_slash=True)
+            return seed_domain, path
+
+
 def resolve_and_strip(base_url: str, href: str) -> str:
     if not href:
         return ""
@@ -732,7 +801,7 @@ def discover_urls(base_url: str, client: httpx.Client) -> Set[str]:
 # ---------------------------------------------------------------------------
 
 
-def crawl(seed_url: str, json_path: str, discover: bool = True) -> None:
+def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Optional[str] = None) -> None:
     # ensure absolute seed with scheme for initial parsing
     seed_abs = (
         seed_url
@@ -744,12 +813,18 @@ def crawl(seed_url: str, json_path: str, discover: bool = True) -> None:
         print("Seed URL must include a hostname", file=sys.stderr)
         sys.exit(2)
 
-    allowed_domain = strip_www_and_port(parsed.netloc)
+    seed_domain = strip_www_and_port(parsed.netloc)
     seed_scheme = parsed.scheme.lower() if parsed.scheme else None
 
-    # Extract the seed path prefix to constrain crawling within that subtree
-    seed_path = normalize_path(parsed.path or "/")
-    seed_path_prefix = seed_path if seed_path != "/" else ""
+    # Determine domain and path prefix for filtering
+    if filter_spec:
+        # Use custom filter specification
+        allowed_domain, seed_path_prefix = parse_filter_spec(filter_spec, seed_domain)
+    else:
+        # Default behavior: extract path prefix from seed URL
+        allowed_domain = seed_domain
+        seed_path = normalize_path(parsed.path or "/")
+        seed_path_prefix = seed_path if seed_path != "/" else ""
 
     # Determine per-domain JSON path (e.g., ghuntley-com.json)
     default_name = pathlib.Path(json_path).name
@@ -911,6 +986,10 @@ def crawl(seed_url: str, json_path: str, discover: bool = True) -> None:
         all_nodes.update(vs)
 
     print(f"Allowed domain: {allowed_domain}")
+    if seed_path_prefix:
+        print(f"Path filter: {seed_path_prefix}")
+    else:
+        print("Path filter: (none - whole domain)")
     print(f"Unique same-domain URLs known: {len(all_nodes)}")
     print(f"Pages fetched this run: {pages_fetched}")
     print(f"Graph saved to: {domain_json_path}")
@@ -934,8 +1013,18 @@ def main() -> None:
         action="store_true",
         help="Skip URL discovery from robots.txt, sitemaps, llms.txt, feeds",
     )
+    parser.add_argument(
+        "--filter",
+        default=None,
+        help=(
+            "Optional domain/path filter (overrides default path extraction from seed URL). "
+            "Supports: full URLs (https://example.com/path), domain+path (example.com/path), "
+            "or bare paths (path/to/filter or /path/to/filter). "
+            "If unspecified, filters to seed URL's path."
+        ),
+    )
     args = parser.parse_args()
-    crawl(args.url, args.json, discover=not args.no_discover)
+    crawl(args.url, args.json, discover=not args.no_discover, filter_spec=args.filter)
 
 
 if __name__ == "__main__":
