@@ -203,6 +203,34 @@ def normalize_path(path: str, strip_trailing_slash: bool = True) -> str:
     return path
 
 
+def _is_valid_url_path(path: str) -> bool:
+    """Check if path looks like a valid URL path (not CSS selector or other junk)."""
+    # CSS selector patterns that shouldn't appear in URLs
+    invalid_patterns = [
+        '::',      # CSS pseudo-elements
+        ':has(',   # CSS :has()
+        ':not(',   # CSS :not()
+        ':is(',    # CSS :is()
+        ':where(', # CSS :where()
+        ':nth-',   # CSS :nth-child, :nth-of-type, etc.
+        ':hover',  # CSS pseudo-classes
+        ':focus',  # CSS pseudo-classes
+        '[data-',  # CSS attribute selectors
+        '{',       # CSS blocks
+        '}',
+        '\\.',     # Escaped CSS
+        '*.',      # CSS wildcards
+    ]
+    path_lower = path.lower()
+    for pattern in invalid_patterns:
+        if pattern in path_lower:
+            return False
+    # Also reject paths with unbalanced parentheses (common in CSS)
+    if path.count('(') != path.count(')'):
+        return False
+    return True
+
+
 def canonical_key(url: str) -> str:
     """
     Canonical key that is insensitive to scheme, www, port, and trailing slash.
@@ -210,9 +238,13 @@ def canonical_key(url: str) -> str:
       - https://www.example.com/   -> example.com
       - http://example.com/about/  -> example.com/about
     Query params and fragments are discarded.
+    Returns empty string for invalid URLs (e.g., CSS selectors).
     """
     p = urlparse(url)
     if not p.netloc:
+        return ""
+    # Validate path before processing
+    if not _is_valid_url_path(p.path or "/"):
         return ""
     host = strip_www_and_port(p.netloc)
 
@@ -786,14 +818,32 @@ def discover_urls(base_url: str, client: httpx.Client, seed_path: str = "") -> S
         return []
 
     def discover_from_llms() -> List[str]:
-        # Try llms.txt at seed path first, then root
+        # Try llms.txt at seed path, parent paths, and root
         paths_to_try = []
         if seed_path:
+            # Add the seed path itself
             paths_to_try.append(f"{seed_path.rstrip('/')}/llms.txt")
+            # Add parent paths (e.g., /docs/en -> /docs -> /)
+            parts = seed_path.strip('/').split('/')
+            for i in range(len(parts) - 1, 0, -1):
+                parent = '/' + '/'.join(parts[:i])
+                paths_to_try.append(f"{parent}/llms.txt")
         paths_to_try.append("/llms.txt")
 
         for path in paths_to_try:
-            content = fetch_text(urljoin(base_url, path), client)
+            url = urljoin(base_url, path)
+            try:
+                # Use a non-following client to detect redirects
+                r = client.get(url, timeout=15, follow_redirects=False)
+                if r.status_code >= 300:
+                    continue  # Skip redirects - not a real llms.txt
+                content_type = r.headers.get("content-type", "").lower()
+                # llms.txt should be text/plain or text/markdown, not HTML
+                if "html" in content_type:
+                    continue
+                content = r.text
+            except Exception:
+                continue
             if content:
                 return parse_llms_txt(content, base_url)
         return []
