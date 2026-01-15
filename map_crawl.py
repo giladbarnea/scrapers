@@ -409,7 +409,7 @@ def is_page_like_canon(canon: str) -> bool:
     if path == "/":
         return True
     _, ext = posixpath.splitext(path)
-    return ext.lower() in {"", ".html", ".htm"}
+    return ext.lower() in {"", ".html", ".htm", ".md"}
 
 
 def clean_mapping_assets(mapping: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -541,8 +541,10 @@ def fetch_text(
         r = client.get(url, timeout=15, headers=headers)
         if r.status_code >= 400:
             return None
-        # Handle gzip
-        if url.endswith(".gz") or r.headers.get("content-encoding") == "gzip":
+        # Handle .gz files (actual gzipped content, not HTTP transport compression)
+        # Note: httpx automatically handles content-encoding gzip, so we only need
+        # to manually decompress actual .gz files
+        if url.endswith(".gz"):
             return gzip.decompress(r.content).decode("utf-8")
         return r.text
     except Exception:
@@ -752,10 +754,15 @@ def parse_html_head_links(content: str, base_url: str) -> Tuple[List[str], List[
     return sitemap_urls, feed_urls
 
 
-def discover_urls(base_url: str, client: httpx.Client) -> Set[str]:
+def discover_urls(base_url: str, client: httpx.Client, seed_path: str = "") -> Set[str]:
     """
     Discover URLs from all sources in parallel.
     Returns deduplicated set with .md preference.
+
+    Args:
+        base_url: The domain root URL (e.g., https://example.com)
+        client: httpx client
+        seed_path: Optional path prefix from the seed URL (e.g., /docs)
     """
     all_urls: List[str] = []
 
@@ -779,8 +786,17 @@ def discover_urls(base_url: str, client: httpx.Client) -> Set[str]:
         return []
 
     def discover_from_llms() -> List[str]:
-        content = fetch_text(urljoin(base_url, "/llms.txt"), client)
-        return parse_llms_txt(content, base_url) if content else []
+        # Try llms.txt at seed path first, then root
+        paths_to_try = []
+        if seed_path:
+            paths_to_try.append(f"{seed_path.rstrip('/')}/llms.txt")
+        paths_to_try.append("/llms.txt")
+
+        for path in paths_to_try:
+            content = fetch_text(urljoin(base_url, path), client)
+            if content:
+                return parse_llms_txt(content, base_url)
+        return []
 
     def discover_from_feeds_wrapper() -> List[str]:
         return discover_from_feeds(base_url, client)
@@ -891,7 +907,7 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
     if discover:
         print("Discovering URLs from sitemaps, llms.txt, feeds...", file=sys.stderr)
         base_url = f"{seed_scheme or 'https'}://{allowed_domain}"
-        discovered = discover_urls(base_url, client)
+        discovered = discover_urls(base_url, client, seed_path_prefix)
 
         # Filter to allowed domain/path and add to queue
         added = 0
@@ -905,6 +921,11 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
                 added += 1
         if added:
             print(f"Added {added} discovered URLs to queue", file=sys.stderr)
+            # If we discovered URLs, remove the seed from queue - we don't need to crawl it
+            # since discovery already gave us the URL list (e.g., from llms.txt)
+            if seed_canon in to_visit:
+                to_visit.remove(seed_canon)
+                print(f"Skipping seed URL crawl (discovery provided URLs)", file=sys.stderr)
 
     try:
         while to_visit:
