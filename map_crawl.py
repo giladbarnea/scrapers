@@ -9,8 +9,6 @@
 # ///
 
 """
-I’ll outline reliable metadata sources and a concrete, non-ML graph approach you can implement quickly.
-
 1) Metadata you can fetch (and how reliable)
 
 • HTTP response headers (via httpx):
@@ -74,6 +72,33 @@ If you want, I can extend the script to:
 • Extract publish/modified dates with confidence,
 • Restrict edges to in-article links,
 • Compute and print the best reading path(s) to a target post.
+
+---
+
+# /usr/local/bin/mc
+```sh
+#!/usr/bin/env zsh
+
+main(){
+  local arg
+  local seen_json_arg=false
+  local -a args
+  for arg in "$@"; do
+    if [[ "$arg" = -j || "$arg" = --json ]]; then
+      seen_json_arg=true
+    fi
+    args+=("$1")
+  done
+  local json_destination
+  if [[ "$seen_json_arg" = false ]]; then
+    json_destination="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 4)"
+    echo "[WARNING] [mc] -j,--json arg was not provided. Writing results to /tmp/$json_destination.json. Read with ‘jq .urls /tmp/$json_destination.json -r’" 1>&2
+    args+=(-j "$json_destination")
+  fi
+  $HOME/dev/scrapers/map_crawl.py "${args[@]}"
+}
+main "$@"
+```
 """
 
 import argparse
