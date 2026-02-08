@@ -115,7 +115,8 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+from fetch_utils import fetch_html_with_playwright, needs_javascript
 
 # File extensions that clearly indicate non-page assets we should not follow/store
 ASSET_EXTENSIONS: Set[str] = {
@@ -498,37 +499,6 @@ def fetch_html(
         except Exception:
             continue
     return None
-
-
-def fetch_html_playwright(url: str) -> Optional[Tuple[str, str]]:
-    """
-    Fetch HTML using Playwright for JavaScript-rendered pages.
-    Returns (url, html) or None if failed.
-    """
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="stupid-simple-crawler/0.1 (+https://example.invalid)"
-            )
-            page = context.new_page()
-
-            # Navigate and wait for network to be idle
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30000)
-            except PlaywrightTimeout:
-                # Try with just domcontentloaded if networkidle times out
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-            # Wait a bit more for any dynamic content
-            page.wait_for_timeout(1000)
-
-            html = page.content()
-            browser.close()
-            return url, html
-    except Exception as e:
-        print(f"Playwright fetch failed for {url}: {e}", file=sys.stderr)
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1007,50 +977,15 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
             fetch_url, html = fetched
             links = extract_links(html, fetch_url)
 
-            # Heuristics to detect JavaScript-rendered pages that need Playwright
-            soup = BeautifulSoup(html, "html.parser")
-
-            # 1. Check noscript tags for JS warnings
-            has_noscript_warning = False
-            for noscript in soup.find_all("noscript"):
-                text = noscript.get_text().lower()
-                if "enable javascript" in text or "javascript enabled" in text:
-                    has_noscript_warning = True
-                    break
-
-            # 2. Check for Next.js or Nuxt.js mount points
-            has_nextjs = bool(soup.find("div", id="__next"))
-            has_nuxtjs = bool(soup.find("div", id="__nuxt"))
-
-            # 3. Check for empty Vue.js app div
-            app_div = soup.find("div", id="app")
-            has_empty_vue_app = app_div and not app_div.get_text(strip=True)
-
-            # 4. Check for Angular app-root
-            has_angular_root = bool(soup.find("app-root"))
-
-            # 5. Check for framework-specific paths
-            has_framework_paths = "/_next/static/" in html or "/_nuxt/" in html
-
-            needs_playwright = (
-                has_noscript_warning
-                or has_nextjs
-                or has_nuxtjs
-                or has_empty_vue_app
-                or has_angular_root
-                or has_framework_paths
-                or not links
-                or html.count('<script') >= html.count('<div')
-            )
-
-            if needs_playwright:
+            if needs_javascript(html) or not links:
                 print(f"Detected JS-rendered page, trying Playwright for: {fetch_url}", file=sys.stderr)
-                pw_fetched = fetch_html_playwright(fetch_url)
-                if pw_fetched:
-                    _, html = pw_fetched
+                try:
+                    html = fetch_html_with_playwright(fetch_url)
                     links = extract_links(html, fetch_url)
                     if links:
                         print(f"Playwright found {len(links)} links!", file=sys.stderr)
+                except Exception as e:
+                    print(f"Playwright fetch failed for {fetch_url}: {e}", file=sys.stderr)
 
             out_neighbors: Set[str] = set()
             for link in links:
