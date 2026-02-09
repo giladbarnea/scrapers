@@ -57,19 +57,43 @@ _DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebK
 
 
 def fetch_html_with_playwright(
-    url: str, timeout: int = 30, user_agent: str = _DEFAULT_USER_AGENT
+    url: str,
+    timeout: int = 30,
+    user_agent: str = _DEFAULT_USER_AGENT,
+    headless: bool = True,
 ) -> str:
     """
     Fetch HTML using Playwright for JavaScript-rendered pages.
     Returns the rendered HTML content.
+
+    Uses system Chrome (channel="chrome") with basic anti-detection
+    measures.  Falls back to the bundled Chromium if Chrome isn't
+    installed.
+
+    Args:
+        headless: When False, opens a visible browser window.  Useful for
+            sites behind Cloudflare that block headless browsers.
 
     Raises on failure — caller should handle exceptions.
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=user_agent)
+        try:
+            browser = p.chromium.launch(
+                channel="chrome",
+                headless=headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception:
+            browser = p.chromium.launch(headless=headless)
+
+        context = browser.new_context(
+            user_agent=user_agent,
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            java_script_enabled=True,
+        )
         page = context.new_page()
 
         timeout_ms = timeout * 1000
@@ -78,7 +102,7 @@ def fetch_html_with_playwright(
         except PlaywrightTimeout:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(2000)
 
         html = page.content()
         browser.close()

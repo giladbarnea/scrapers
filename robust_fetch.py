@@ -27,6 +27,7 @@ Usage:
 Options:
     --timeout SECONDS       Timeout in seconds for each method (default: 30)
     -s, --scraper SCRAPER   Force a specific scraper (curl, playwright/pw, markitdown/mid, jina, firecrawl/fc)
+    --no-headless           Open a visible browser window (Playwright only)
 
 Returns:
     The fetched content on stdout
@@ -93,7 +94,7 @@ def is_pdf_url(url: str) -> bool:
     return path.endswith(".pdf") or ".pdf?" in path or ".pdf#" in path
 
 
-def fetch_with_playwright(url: str, timeout: int) -> str:
+def fetch_with_playwright(url: str, timeout: int, headless: bool = True) -> str:
     """
     Fetch URL using Playwright and convert to markdown.
     This is a standalone method for forced Playwright usage.
@@ -105,7 +106,7 @@ def fetch_with_playwright(url: str, timeout: int) -> str:
             "markitdown not installed. Are you sure you ran this script with `uv run`?"
         )
 
-    html_content = fetch_html_with_playwright(url, timeout)
+    html_content = fetch_html_with_playwright(url, timeout, headless=headless)
 
     # Convert HTML to markdown using MarkItDown
     stream = io.BytesIO(html_content.encode('utf-8'))
@@ -177,7 +178,7 @@ def try_markdown_url(url: str, timeout: int) -> Optional[str]:
         return None
 
 
-def fetch_with_curl_cffi(url: str, timeout: int) -> str:
+def fetch_with_curl_cffi(url: str, timeout: int, headless: bool = True) -> str:
     """
     Attempt to fetch URL using curl_cffi with browser impersonation.
     First tries to fetch raw markdown at URL.md if available.
@@ -220,7 +221,7 @@ def fetch_with_curl_cffi(url: str, timeout: int) -> str:
     if needs_javascript(html_content):
         print(f"[robust_fetch] Detected JS-rendered page, using Playwright for: {url}", file=sys.stderr)
         # Refetch with Playwright to get rendered content
-        html_content = fetch_html_with_playwright(url, timeout)
+        html_content = fetch_html_with_playwright(url, timeout, headless=headless)
 
     # Convert HTML to markdown using MarkItDown
     stream = io.BytesIO(html_content.encode('utf-8'))
@@ -360,7 +361,7 @@ def fetch_with_firecrawl(url: str, timeout: int) -> str:
     return markdown
 
 
-def robust_fetch(url: str, timeout: int = 30, scraper: Optional[str] = None) -> str:
+def robust_fetch(url: str, timeout: int = 30, scraper: Optional[str] = None, headless: bool = True) -> str:
     """
     Fetch URL content using multiple fallback methods.
 
@@ -368,6 +369,7 @@ def robust_fetch(url: str, timeout: int = 30, scraper: Optional[str] = None) -> 
         url: The URL to fetch
         timeout: Timeout in seconds for each method
         scraper: Optional scraper to force (e.g., 'curl', 'playwright', 'jina')
+        headless: When False, Playwright opens a visible browser window.
 
     Returns:
         The fetched content as a string
@@ -375,10 +377,15 @@ def robust_fetch(url: str, timeout: int = 30, scraper: Optional[str] = None) -> 
     Raises:
         Exception: If all methods fail or specified scraper fails
     """
+    # Bind headless into the Playwright-aware scrapers so every method
+    # keeps the same (url, timeout) -> str call signature.
+    _fetch_with_curl_cffi: Callable[[str, int], str] = lambda u, t: fetch_with_curl_cffi(u, t, headless=headless)
+    _fetch_with_playwright: Callable[[str, int], str] = lambda u, t: fetch_with_playwright(u, t, headless=headless)
+
     # Map of method names to fetch functions
     method_map: Dict[str, Callable[[str, int], str]] = {
-        "curl_cffi": fetch_with_curl_cffi,
-        "playwright": fetch_with_playwright,
+        "curl_cffi": _fetch_with_curl_cffi,
+        "playwright": _fetch_with_playwright,
         "markitdown": fetch_with_markitdown,
         "jina_reader": fetch_with_jina_reader,
         "firecrawl": fetch_with_firecrawl,
@@ -404,8 +411,8 @@ def robust_fetch(url: str, timeout: int = 30, scraper: Optional[str] = None) -> 
 
     # Otherwise, try all methods in order
     methods = [
-        ("curl_cffi", fetch_with_curl_cffi),
-        ("playwright", fetch_with_playwright),
+        ("curl_cffi", _fetch_with_curl_cffi),
+        ("playwright", _fetch_with_playwright),
         ("markitdown", fetch_with_markitdown),
         ("jina_reader", fetch_with_jina_reader),
         ("firecrawl", fetch_with_firecrawl),
@@ -451,6 +458,12 @@ def main():
         default=None,
         help="Force a specific scraper (curl, playwright/pw, markitdown/mid, jina, firecrawl/fc)",
     )
+    parser.add_argument(
+        "--no-headless",
+        action="store_true",
+        default=False,
+        help="Open a visible browser window (Playwright only). Useful for sites that block headless browsers.",
+    )
 
     args = parser.parse_args()
 
@@ -458,7 +471,7 @@ def main():
     url = normalize_url(args.url)
 
     try:
-        content = robust_fetch(url, args.timeout, args.scraper)
+        content = robust_fetch(url, args.timeout, args.scraper, headless=not args.no_headless)
         # Add frontmatter with the URL and created date
         created_date = datetime.now().strftime("%Y-%m-%d")
         output = f"---\nurl: {url}\ncreated: {created_date}\n---\n\n{content}"
