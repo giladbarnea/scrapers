@@ -97,12 +97,15 @@ def fetch_html_with_playwright(
         page = context.new_page()
 
         timeout_ms = timeout * 1000
-        try:
-            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-        except PlaywrightTimeout:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-        page.wait_for_timeout(2000)
+        # Give JS time to render after DOM is ready. Try networkidle with
+        # a short cap — if the page has long-lived connections (analytics,
+        # websockets) this fires quickly instead of burning the full timeout.
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeout:
+            pass
 
         html = page.content()
         browser.close()
