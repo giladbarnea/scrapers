@@ -78,26 +78,7 @@ If you want, I can extend the script to:
 # /usr/local/bin/mc
 ```sh
 #!/usr/bin/env zsh
-
-main(){
-  local arg
-  local seen_json_arg=false
-  local -a args
-  for arg in "$@"; do
-    if [[ "$arg" = -j || "$arg" = --json ]]; then
-      seen_json_arg=true
-    fi
-    args+=("$1")
-  done
-  local json_destination
-  if [[ "$seen_json_arg" = false ]]; then
-    json_destination="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 4)"
-    echo "[WARNING] [mc] -j,--json arg was not provided. Writing results to /tmp/$json_destination.json. Read with ‘jq .urls /tmp/$json_destination.json -r’" 1>&2
-    args+=(-j "$json_destination")
-  fi
-  $HOME/dev/scrapers/map_crawl.py "${args[@]}"
-}
-main "$@"
+$HOME/dev/scrapers/map_crawl.py "$@"
 ```
 """
 
@@ -862,7 +843,7 @@ def discover_urls(base_url: str, client: httpx.Client, seed_path: str = "") -> S
 # ---------------------------------------------------------------------------
 
 
-def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Optional[str] = None, url_limit: int = 1000, page_limit: Optional[int] = None) -> None:
+def crawl(seed_url: str, json_path: Optional[str] = None, discover: bool = True, filter_spec: Optional[str] = None, url_limit: int = 1000, page_limit: Optional[int] = None) -> None:
     # ensure absolute seed with scheme for initial parsing
     seed_abs = (
         seed_url
@@ -888,11 +869,11 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
         seed_path_prefix = seed_path if seed_path != "/" else ""
 
     # Determine output JSON path
-    default_name = pathlib.Path(json_path).name
-    domain_filename = f"{allowed_domain.replace('.', '-')}.json"
-    out_json_path = (
-        domain_filename if default_name == "crawl_map.json" else json_path
-    )
+    if json_path:
+        out_json_path = json_path
+    else:
+        out_json_path = f"{allowed_domain.replace('.', '-')}.json"
+        print(f"[map_crawl] --json not provided, writing to {out_json_path}", file=sys.stderr)
 
     visited: Set[str] = set()
     to_visit: List[str] = []
@@ -1037,8 +1018,8 @@ def main() -> None:
     parser.add_argument(
         "-j",
         "--json",
-        default="crawl_map.json",
-        help="Path to JSON map file (default: ./crawl_map.json)",
+        default=None,
+        help="Path to JSON map file (default: <domain>.json)",
     )
     parser.add_argument(
         "--no-discover",
