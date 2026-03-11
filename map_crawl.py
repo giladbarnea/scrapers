@@ -1013,7 +1013,10 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
                     continue
                 if not is_page_like_canon(c):
                     continue
+                if c not in known_urls and len(known_urls) >= url_limit:
+                    continue
                 out_neighbors.add(c)
+                known_urls.add(c)
                 if c not in canon_to_sample:
                     canon_to_sample[c] = link
 
