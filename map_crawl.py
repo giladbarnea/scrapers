@@ -355,6 +355,9 @@ def resolve_and_strip(base_url: str, href: str) -> str:
     # ignore non-http(S) schemes and other non-page targets
     if re.match(r"^(javascript:|mailto:|tel:|data:|sms:|ftp:)", href, re.IGNORECASE):
         return ""
+    # MediaWiki broken template links (missing link target)
+    if "--error:" in href:
+        return ""
     abs_url = urljoin(base_url, href)
     parts = list(urlparse(abs_url))
     # strip query and fragment
@@ -494,6 +497,8 @@ def fetch_html(
                 continue
             ctype = r.headers.get("content-type", "").lower()
             if "html" not in ctype:
+                continue
+            if len(r.text.strip()) < 50:
                 continue
             return u, r.text
         except Exception:
@@ -862,7 +867,7 @@ def discover_urls(base_url: str, client: httpx.Client, seed_path: str = "") -> S
 # ---------------------------------------------------------------------------
 
 
-def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Optional[str] = None) -> None:
+def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Optional[str] = None, url_limit: int = 1000, page_limit: Optional[int] = None) -> None:
     # ensure absolute seed with scheme for initial parsing
     seed_abs = (
         seed_url
@@ -917,6 +922,8 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
     canon_to_sample: Dict[str, str] = {seed_canon: seed_abs}
 
     pages_fetched = 0
+    url_limit_hit = False
+    known_urls: Set[str] = {seed_canon}
 
     client = httpx.Client(
         follow_redirects=True,
@@ -932,11 +939,14 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
         # Filter to allowed domain/path and add to queue
         added = 0
         for canon in discovered:
+            if len(known_urls) >= url_limit:
+                break
             if not within_path_prefix(
                 f"https://{canon}", allowed_domain, seed_path_prefix
             ):
                 continue
-            if canon not in visited and canon not in to_visit:
+            if canon not in known_urls:
+                known_urls.add(canon)
                 to_visit.append(canon)
                 added += 1
         if added:
@@ -949,6 +959,9 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
 
     try:
         while to_visit:
+            if page_limit is not None and pages_fetched >= page_limit:
+                print(f"Page limit of {page_limit} reached, stopping crawl ({len(to_visit)} URLs remaining in queue)", file=sys.stderr)
+                break
             current = to_visit.pop(0)
             if current in visited:
                 continue
@@ -959,13 +972,17 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
                 for nb in mapping.get(current, []):
                     if not is_page_like_canon(nb):
                         continue
-                    if nb not in visited and nb not in to_visit:
+                    if nb not in known_urls:
+                        if len(known_urls) >= url_limit:
+                            break
+                        known_urls.add(nb)
                         to_visit.append(nb)
                 continue
 
             urls_to_try = pick_fetch_urls(
                 current, canon_to_sample.get(current), seed_scheme
             )
+            print(f"[{pages_fetched + 1}/{len(visited) + len(to_visit)}] {current[:80]}", file=sys.stderr)
             fetched = fetch_html(urls_to_try, client)
             if not fetched:
                 # Record as crawled with zero links to avoid retrying in future runs
@@ -1006,7 +1023,13 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
             pages_fetched += 1
 
             for nb in mapping[current]:
-                if nb not in visited and nb not in to_visit:
+                if nb not in known_urls:
+                    if len(known_urls) >= url_limit:
+                        if not url_limit_hit:
+                            url_limit_hit = True
+                            print(f"URL limit of {url_limit} reached, not adding more URLs to queue", file=sys.stderr)
+                        break
+                    known_urls.add(nb)
                     to_visit.append(nb)
     finally:
         client.close()
@@ -1054,8 +1077,20 @@ def main() -> None:
             "If unspecified, filters to seed URL's path."
         ),
     )
+    parser.add_argument(
+        "--url-limit",
+        type=int,
+        default=1000,
+        help="Max unique URLs to track (default: 1000). Stops adding new URLs to the queue when reached.",
+    )
+    parser.add_argument(
+        "--page-limit",
+        type=int,
+        default=None,
+        help="Max pages to fetch. Stops crawling when reached and outputs what it has.",
+    )
     args = parser.parse_args()
-    crawl(args.url, args.json, discover=not args.no_discover, filter_spec=args.filter)
+    crawl(args.url, args.json, discover=not args.no_discover, filter_spec=args.filter, url_limit=args.url_limit, page_limit=args.page_limit)
 
 
 if __name__ == "__main__":
