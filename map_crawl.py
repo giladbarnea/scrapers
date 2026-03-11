@@ -887,24 +887,13 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
         seed_path = normalize_path(parsed.path or "/")
         seed_path_prefix = seed_path if seed_path != "/" else ""
 
-    # Determine per-domain JSON path (e.g., ghuntley-com.json)
+    # Determine output JSON path
     default_name = pathlib.Path(json_path).name
     domain_filename = f"{allowed_domain.replace('.', '-')}.json"
-    domain_json_path = (
+    out_json_path = (
         domain_filename if default_name == "crawl_map.json" else json_path
     )
 
-    # One-time migration from old crawl_map.json to per-domain store
-    if (
-        default_name == "crawl_map.json"
-        and pathlib.Path(json_path).exists()
-        and not pathlib.Path(domain_json_path).exists()
-    ):
-        old_mapping = load_store(json_path)
-        old_mapping = clean_mapping_assets(old_mapping)
-        write_store(old_mapping, domain_json_path)
-
-    mapping = load_store(domain_json_path)
     visited: Set[str] = set()
     to_visit: List[str] = []
 
@@ -915,15 +904,45 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
 
     to_visit.append(seed_canon)
     canon_to_sample: Dict[str, str] = {seed_canon: seed_abs}
+    # Distance from seed: seed itself is -1 (excluded from output),
+    # its direct links are 0, their links are 1, etc.
+    canon_to_distance: Dict[str, int] = {seed_canon: -1}
 
     pages_fetched = 0
     url_limit_hit = False
     known_urls: Set[str] = {seed_canon}
 
+    def save_output() -> None:
+        by_distance: Dict[int, List[str]] = {}
+        for canon, dist in canon_to_distance.items():
+            if dist < 0:
+                continue
+            by_distance.setdefault(dist, []).append(canon)
+        data = {"urls": {str(d): sorted(urls) for d, urls in sorted(by_distance.items())}}
+        tmp = out_json_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        pathlib.Path(tmp).replace(out_json_path)
+
     client = httpx.Client(
         follow_redirects=True,
         headers={"User-Agent": "stupid-simple-crawler/0.1 (+https://example.invalid)"},
     )
+
+    def add_url(canon: str, distance: int) -> bool:
+        """Try to add a URL. Returns True if it was new and added."""
+        nonlocal url_limit_hit
+        if canon in known_urls:
+            return False
+        if len(known_urls) >= url_limit:
+            if not url_limit_hit:
+                url_limit_hit = True
+                print(f"URL limit of {url_limit} reached", file=sys.stderr)
+            return False
+        known_urls.add(canon)
+        canon_to_distance[canon] = distance
+        to_visit.append(canon)
+        return True
 
     # URL discovery from robots.txt, sitemaps, llms.txt, feeds
     if discover:
@@ -931,23 +950,16 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
         base_url = f"{seed_scheme or 'https'}://{allowed_domain}"
         discovered = discover_urls(base_url, client, seed_path_prefix)
 
-        # Filter to allowed domain/path and add to queue
         added = 0
         for canon in discovered:
-            if len(known_urls) >= url_limit:
-                break
             if not within_path_prefix(
                 f"https://{canon}", allowed_domain, seed_path_prefix
             ):
                 continue
-            if canon not in known_urls:
-                known_urls.add(canon)
-                to_visit.append(canon)
+            if add_url(canon, 0):
                 added += 1
         if added:
             print(f"Added {added} discovered URLs to queue", file=sys.stderr)
-            # If we discovered URLs, remove the seed from queue - we don't need to crawl it
-            # since discovery already gave us the URL list (e.g., from llms.txt)
             if seed_canon in to_visit:
                 to_visit.remove(seed_canon)
                 print(f"Skipping seed URL crawl (discovery provided URLs)", file=sys.stderr)
@@ -962,28 +974,12 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
                 continue
             visited.add(current)
 
-            # If we already crawled it in previous sessions, expand neighbors without refetching
-            if current in mapping:
-                for nb in mapping.get(current, []):
-                    if not is_page_like_canon(nb):
-                        continue
-                    if nb not in known_urls:
-                        if len(known_urls) >= url_limit:
-                            break
-                        known_urls.add(nb)
-                        to_visit.append(nb)
-                continue
-
             urls_to_try = pick_fetch_urls(
                 current, canon_to_sample.get(current), seed_scheme
             )
             print(f"[{pages_fetched + 1}/{len(visited) + len(to_visit)}] {current[:80]}", file=sys.stderr)
             fetched = fetch_html(urls_to_try, client)
             if not fetched:
-                # Record as crawled with zero links to avoid retrying in future runs
-                mapping[current] = []
-                mapping = clean_mapping_assets(mapping)
-                write_store(mapping, domain_json_path)
                 continue
 
             fetch_url, html = fetched
@@ -999,49 +995,38 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
                 except Exception as e:
                     print(f"Playwright fetch failed for {fetch_url}: {e}", file=sys.stderr)
 
-            out_neighbors: Set[str] = set()
+            current_distance = canon_to_distance.get(current, 0)
+            child_distance = current_distance + 1
             for link in links:
                 if not within_path_prefix(link, allowed_domain, seed_path_prefix):
                     continue
                 c = canonical_key(link)
-                if not c:
+                if not c or not is_page_like_canon(c):
                     continue
-                if not is_page_like_canon(c):
-                    continue
-                if c not in known_urls:
-                    if len(known_urls) >= url_limit:
-                        if not url_limit_hit:
-                            url_limit_hit = True
-                            print(f"URL limit of {url_limit} reached, not adding more URLs to queue", file=sys.stderr)
-                        continue
-                    known_urls.add(c)
-                    to_visit.append(c)
-                out_neighbors.add(c)
+                add_url(c, child_distance)
                 if c not in canon_to_sample:
                     canon_to_sample[c] = link
 
-            mapping[current] = sorted(out_neighbors)
-            mapping = clean_mapping_assets(mapping)
-            write_store(mapping, domain_json_path)
             pages_fetched += 1
+            save_output()
     finally:
         client.close()
 
-    # Produce a concise summary and list all known nodes
-    all_nodes: Set[str] = set(mapping.keys())
-    for vs in mapping.values():
-        all_nodes.update(vs)
+    save_output()
 
-    print(f"Allowed domain: {allowed_domain}")
+    total_urls = len(known_urls) - 1  # exclude seed
+    print(f"Allowed domain: {allowed_domain}", file=sys.stderr)
     if seed_path_prefix:
-        print(f"Path filter: {seed_path_prefix}")
+        print(f"Path filter: {seed_path_prefix}", file=sys.stderr)
     else:
-        print("Path filter: (none - whole domain)")
-    print(f"Unique same-domain URLs known: {len(all_nodes)}")
-    print(f"Pages fetched this run: {pages_fetched}")
-    print(f"Graph saved to: {domain_json_path}")
-    for node in sorted(all_nodes):
-        print(node)
+        print(f"Path filter: (none - whole domain)", file=sys.stderr)
+    print(f"Unique URLs found: {total_urls}", file=sys.stderr)
+    print(f"Pages fetched: {pages_fetched}", file=sys.stderr)
+    print(f"Saved to: {out_json_path}", file=sys.stderr)
+    max_dist = max((d for d in canon_to_distance.values() if d >= 0), default=-1)
+    for d in range(max_dist + 1):
+        count = sum(1 for v in canon_to_distance.values() if v == d)
+        print(f"  distance {d}: {count} URLs", file=sys.stderr)
 
 
 def main() -> None:
