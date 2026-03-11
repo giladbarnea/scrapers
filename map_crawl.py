@@ -355,9 +355,6 @@ def resolve_and_strip(base_url: str, href: str) -> str:
     # ignore non-http(S) schemes and other non-page targets
     if re.match(r"^(javascript:|mailto:|tel:|data:|sms:|ftp:)", href, re.IGNORECASE):
         return ""
-    # MediaWiki broken template links (missing link target)
-    if "--error:" in href:
-        return ""
     abs_url = urljoin(base_url, href)
     parts = list(urlparse(abs_url))
     # strip query and fragment
@@ -497,8 +494,6 @@ def fetch_html(
                 continue
             ctype = r.headers.get("content-type", "").lower()
             if "html" not in ctype:
-                continue
-            if len(r.text.strip()) < 50:
                 continue
             return u, r.text
         except Exception:
@@ -994,7 +989,7 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
             fetch_url, html = fetched
             links = extract_links(html, fetch_url)
 
-            if needs_javascript(html) or not links:
+            if needs_javascript(html) or (not links and len(html) > 512):
                 print(f"Detected JS-rendered page, trying Playwright for: {fetch_url}", file=sys.stderr)
                 try:
                     html = fetch_html_with_playwright(fetch_url)
@@ -1013,10 +1008,15 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
                     continue
                 if not is_page_like_canon(c):
                     continue
-                if c not in known_urls and len(known_urls) >= url_limit:
-                    continue
+                if c not in known_urls:
+                    if len(known_urls) >= url_limit:
+                        if not url_limit_hit:
+                            url_limit_hit = True
+                            print(f"URL limit of {url_limit} reached, not adding more URLs to queue", file=sys.stderr)
+                        continue
+                    known_urls.add(c)
+                    to_visit.append(c)
                 out_neighbors.add(c)
-                known_urls.add(c)
                 if c not in canon_to_sample:
                     canon_to_sample[c] = link
 
@@ -1024,16 +1024,6 @@ def crawl(seed_url: str, json_path: str, discover: bool = True, filter_spec: Opt
             mapping = clean_mapping_assets(mapping)
             write_store(mapping, domain_json_path)
             pages_fetched += 1
-
-            for nb in mapping[current]:
-                if nb not in known_urls:
-                    if len(known_urls) >= url_limit:
-                        if not url_limit_hit:
-                            url_limit_hit = True
-                            print(f"URL limit of {url_limit} reached, not adding more URLs to queue", file=sys.stderr)
-                        break
-                    known_urls.add(nb)
-                    to_visit.append(nb)
     finally:
         client.close()
 
