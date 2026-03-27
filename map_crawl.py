@@ -90,6 +90,7 @@ import pathlib
 import posixpath
 import re
 import sys
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -482,6 +483,34 @@ def fetch_html(
     return None
 
 
+def fetch_links_for_canon(
+    canon: str,
+    sample_full_url: Optional[str],
+    seed_scheme: Optional[str],
+    client: httpx.Client,
+) -> Tuple[Optional[str], List[str], bool, Optional[str]]:
+    """Fetch one canonical URL and extract links without mutating crawl state."""
+    urls_to_try = pick_fetch_urls(canon, sample_full_url, seed_scheme)
+    fetched = fetch_html(urls_to_try, client)
+    if not fetched:
+        return None, [], False, None
+
+    fetch_url, html = fetched
+    links = extract_links(html, fetch_url)
+
+    used_playwright = False
+    playwright_error = None
+    if needs_javascript(html) or (not links and len(html) > 512):
+        used_playwright = True
+        try:
+            html = fetch_html_with_playwright(fetch_url)
+            links = extract_links(html, fetch_url)
+        except Exception as e:
+            playwright_error = str(e)
+
+    return fetch_url, links, used_playwright, playwright_error
+
+
 # ---------------------------------------------------------------------------
 # URL Discovery (robots.txt, sitemaps, llms.txt, feeds)
 # ---------------------------------------------------------------------------
@@ -843,7 +872,7 @@ def discover_urls(base_url: str, client: httpx.Client, seed_path: str = "") -> S
 # ---------------------------------------------------------------------------
 
 
-def crawl(seed_url: str, json_path: Optional[str] = None, discover: bool = True, filter_spec: Optional[str] = None, url_limit: int = 1000, page_limit: Optional[int] = None) -> None:
+def crawl(seed_url: str, json_path: Optional[str] = None, discover: bool = True, filter_spec: Optional[str] = None, url_limit: int = 1000, page_limit: Optional[int] = None, workers: int = 4) -> None:
     # ensure absolute seed with scheme for initial parsing
     seed_abs = (
         seed_url
@@ -876,7 +905,7 @@ def crawl(seed_url: str, json_path: Optional[str] = None, discover: bool = True,
         print(f"[map_crawl] --json not provided, writing to {out_json_path}", file=sys.stderr)
 
     visited: Set[str] = set()
-    to_visit: List[str] = []
+    to_visit: deque[str] = deque()
 
     seed_canon = canonical_key(seed_abs)
     if not seed_canon:
@@ -892,6 +921,10 @@ def crawl(seed_url: str, json_path: Optional[str] = None, discover: bool = True,
     pages_fetched = 0
     url_limit_hit = False
     known_urls: Set[str] = {seed_canon}
+
+    if workers < 1:
+        print("--workers must be at least 1", file=sys.stderr)
+        sys.exit(2)
 
     def save_output() -> None:
         by_distance: Dict[int, List[str]] = {}
@@ -925,6 +958,25 @@ def crawl(seed_url: str, json_path: Optional[str] = None, discover: bool = True,
         to_visit.append(canon)
         return True
 
+    def pop_frontier() -> Tuple[int, List[str]]:
+        while to_visit and to_visit[0] in visited:
+            to_visit.popleft()
+
+        if not to_visit:
+            return 0, []
+
+        frontier_distance = canon_to_distance.get(to_visit[0], 0)
+        frontier: List[str] = []
+        while to_visit:
+            current = to_visit[0]
+            if current in visited:
+                to_visit.popleft()
+                continue
+            if canon_to_distance.get(current, 0) != frontier_distance:
+                break
+            frontier.append(to_visit.popleft())
+        return frontier_distance, frontier
+
     # URL discovery from robots.txt, sitemaps, llms.txt, feeds
     if discover:
         print("Discovering URLs from sitemaps, llms.txt, feeds...", file=sys.stderr)
@@ -950,46 +1002,75 @@ def crawl(seed_url: str, json_path: Optional[str] = None, discover: bool = True,
             if page_limit is not None and pages_fetched >= page_limit:
                 print(f"Page limit of {page_limit} reached, stopping crawl ({len(to_visit)} URLs remaining in queue)", file=sys.stderr)
                 break
-            current = to_visit.pop(0)
-            if current in visited:
-                continue
-            visited.add(current)
 
-            urls_to_try = pick_fetch_urls(
-                current, canon_to_sample.get(current), seed_scheme
-            )
-            print(f"[{pages_fetched + 1}/{len(visited) + len(to_visit)}] {current[:80]}", file=sys.stderr)
-            fetched = fetch_html(urls_to_try, client)
-            if not fetched:
+            frontier_distance, frontier = pop_frontier()
+            if not frontier:
                 continue
 
-            fetch_url, html = fetched
-            links = extract_links(html, fetch_url)
+            if page_limit is not None:
+                remaining_pages = page_limit - pages_fetched
+                if remaining_pages <= 0:
+                    print(f"Page limit of {page_limit} reached, stopping crawl ({len(to_visit)} URLs remaining in queue)", file=sys.stderr)
+                    break
+                if len(frontier) > remaining_pages:
+                    deferred = frontier[remaining_pages:]
+                    frontier = frontier[:remaining_pages]
+                    for canon in reversed(deferred):
+                        to_visit.appendleft(canon)
 
-            if needs_javascript(html) or (not links and len(html) > 512):
-                print(f"Detected JS-rendered page, trying Playwright for: {fetch_url}", file=sys.stderr)
-                try:
-                    html = fetch_html_with_playwright(fetch_url)
-                    links = extract_links(html, fetch_url)
-                    if links:
+            total_in_flight = len(visited) + len(frontier) + len(to_visit)
+            for offset, current in enumerate(frontier, start=1):
+                visited.add(current)
+                print(f"[{pages_fetched + offset}/{total_in_flight}] {current[:80]}", file=sys.stderr)
+
+            results_by_canon: Dict[str, Tuple[Optional[str], List[str], bool, Optional[str]]] = {}
+            max_frontier_workers = min(workers, len(frontier))
+            with ThreadPoolExecutor(max_workers=max_frontier_workers) as executor:
+                futures = {
+                    executor.submit(
+                        fetch_links_for_canon,
+                        current,
+                        canon_to_sample.get(current),
+                        seed_scheme,
+                        client,
+                    ): current
+                    for current in frontier
+                }
+                for future in as_completed(futures):
+                    current = futures[future]
+                    try:
+                        results_by_canon[current] = future.result()
+                    except Exception as e:
+                        print(f"Fetch failed for {current}: {e}", file=sys.stderr)
+                        results_by_canon[current] = (None, [], False, str(e))
+
+            child_distance = frontier_distance + 1
+            for current in frontier:
+                fetch_url, links, used_playwright, playwright_error = results_by_canon.get(
+                    current, (None, [], False, None)
+                )
+                if not fetch_url:
+                    continue
+
+                if used_playwright:
+                    print(f"Detected JS-rendered page, trying Playwright for: {fetch_url}", file=sys.stderr)
+                    if playwright_error:
+                        print(f"Playwright fetch failed for {fetch_url}: {playwright_error}", file=sys.stderr)
+                    elif links:
                         print(f"Playwright found {len(links)} links!", file=sys.stderr)
-                except Exception as e:
-                    print(f"Playwright fetch failed for {fetch_url}: {e}", file=sys.stderr)
 
-            current_distance = canon_to_distance.get(current, 0)
-            child_distance = current_distance + 1
-            for link in links:
-                if not within_path_prefix(link, allowed_domain, seed_path_prefix):
-                    continue
-                c = canonical_key(link)
-                if not c or not is_page_like_canon(c):
-                    continue
-                add_url(c, child_distance)
-                if c not in canon_to_sample:
-                    canon_to_sample[c] = link
+                for link in links:
+                    if not within_path_prefix(link, allowed_domain, seed_path_prefix):
+                        continue
+                    c = canonical_key(link)
+                    if not c or not is_page_like_canon(c):
+                        continue
+                    add_url(c, child_distance)
+                    if c not in canon_to_sample:
+                        canon_to_sample[c] = link
 
-            pages_fetched += 1
-            save_output()
+                pages_fetched += 1
+                save_output()
     finally:
         client.close()
 
@@ -1048,8 +1129,14 @@ def main() -> None:
         default=None,
         help="Max pages to fetch. Stops crawling when reached and outputs what it has.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Max pages to fetch in parallel within the same distance tier (default: 4).",
+    )
     args = parser.parse_args()
-    crawl(args.url, args.json, discover=not args.no_discover, filter_spec=args.filter, url_limit=args.url_limit, page_limit=args.page_limit)
+    crawl(args.url, args.json, discover=not args.no_discover, filter_spec=args.filter, url_limit=args.url_limit, page_limit=args.page_limit, workers=args.workers)
 
 
 if __name__ == "__main__":
