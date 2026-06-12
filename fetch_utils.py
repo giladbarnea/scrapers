@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
+from bs4 import BeautifulSoup
+
 
 def needs_javascript(html: str) -> bool:
     """
     Detect if a page needs JavaScript to render properly.
     Checks for common SPA framework markers and script-heavy pages.
     """
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return False
-
     soup = BeautifulSoup(html, "html.parser")
 
     # Check noscript tags for JS warnings
@@ -42,6 +39,14 @@ def needs_javascript(html: str) -> bool:
     div_count = html.count("<div")
     high_script_ratio = script_count >= div_count if div_count > 0 else False
 
+    # Empty <ul>/<ol> elements are placeholders for JS-injected content (e.g., nav menus; see zunit.xyz/docs/)
+    empty_list_count = sum(
+        1
+        for list_tag in soup.find_all(["ul", "ol"])
+        if not list_tag.find(True) and not list_tag.get_text(strip=True)
+    )
+    has_empty_list_placeholders = empty_list_count >= 2
+
     return (
         has_noscript_warning
         or has_nextjs
@@ -50,6 +55,7 @@ def needs_javascript(html: str) -> bool:
         or has_angular_root
         or has_framework_paths
         or high_script_ratio
+        or has_empty_list_placeholders
     )
 
 
